@@ -1,0 +1,4 @@
+.env
+.venv/
+__pycache__/
+PayLess_Stripe_*.html
