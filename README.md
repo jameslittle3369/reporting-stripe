@@ -1,14 +1,19 @@
-# PayLess Mobile — Stripe Metrics Report
+# IMT — Stripe Metrics Report
 
 Pulls **every reportable metric** from the connected Stripe account (balance
 activity, payments, payment intents, refunds, disputes, fraud warnings,
-payouts, customers, subscriptions/MRR, invoices, Checkout), charts them
+payouts), charts them
 grouped into sections, builds summary cards, and sends an HTML email with an
 interactive Chart.js attachment via Amazon SES.
 
 Stripe has no "metrics" endpoint, so every series is derived from Stripe's
 list endpoints over the lookback window, bucketed by day in `TIMEZONE`.
 Related series share one chart (e.g. gross / net / fees / refunds).
+
+**Daily mode** (`REPORT_DAYS=1`, the default): reports yesterday with six
+summary cards and the breakdown bar charts — no trend lines and no
+interactive attachment. Any window longer than one day (`--days 30`) produces
+the full report with trend charts and the attachment.
 
 ---
 
@@ -40,9 +45,6 @@ py -3.14 -m venv .venv
 - Balance, Balance transactions
 - Charges, PaymentIntents, Refunds, Disputes
 - Payouts
-- Customers
-- Subscriptions, Invoices, Products
-- Checkout Sessions
 - Radar → Early fraud warnings
 
 A scope you leave out isn't fatal: that section just shows "Not readable with
@@ -78,8 +80,14 @@ Useful flags:
 # Print a sample raw object from each Stripe endpoint
 .venv\Scripts\python.exe stripe_report.py --preview --debug
 
-# Override the lookback window for this run
-.venv\Scripts\python.exe stripe_report.py --days 7
+# Override the lookback window for this run (full report with trends)
+.venv\Scripts\python.exe stripe_report.py --days 30
+
+# Report one specific day (condensed daily report) - e.g. to backfill a missed run
+.venv\Scripts\python.exe stripe_report.py --date 2026-10-28
+
+# Report an inclusive date range (full report; a one-day range is condensed)
+.venv\Scripts\python.exe stripe_report.py --range 2026-10-01 2026-10-28
 
 # Override recipients for this run
 .venv\Scripts\python.exe stripe_report.py --to ops@example.com ceo@example.com
@@ -92,7 +100,7 @@ interactive report and the email body locally instead of sending.
 
 ## Scheduling (Windows Task Scheduler)
 
-1. **Task Scheduler** → **Create Basic Task**, trigger e.g. **Weekly**, Monday 7:00 AM
+1. **Task Scheduler** → **Create Basic Task**, trigger **Daily**, e.g. 7:00 AM (reports the previous day)
 2. Action **Start a Program**:
    - **Program:** `D:\projects\reporting\Stripe\.venv\Scripts\python.exe`
    - **Arguments:** `stripe_report.py`
@@ -103,11 +111,22 @@ interactive report and the email body locally instead of sending.
 
 ## What's reported
 
-**Summary cards:** Gross Volume, Net Volume, Stripe Fees, Successful Payments,
-Payment Success Rate, Average Payment, Refunded, Disputes, New Customers,
-Active Subscriptions, MRR, Open Invoices, Checkout Conversion, Paid Out,
-Available Balance, Pending Balance. A card is left out when its source
-couldn't be read.
+**Daily summary cards:**
+
+| Card | Source |
+|---|---|
+| Payouts | Payouts arriving yesterday with status `paid` |
+| Captures | Charge balance transactions created yesterday — everything captured yesterday, including auths from earlier days |
+| Auths | Total authorized amount of yesterday's authorizations, excluding ones released without capture (captured auths count at their full authorized amount). Detail line: auth count, captured (amount actually captured), pending capture, released |
+| Refunds | Refund balance transactions created yesterday |
+| Fees | Per-transaction Stripe fees on yesterday's balance transactions |
+| Disputes | Disputes opened yesterday (count and amount) |
+
+**Multi-day summary cards:** Gross Volume, Net Volume, Stripe Fees, Captures,
+Auths, Successful Payments, Payment Success Rate, Average Payment, Refunded,
+Disputes, Paid Out, Available Balance, Pending Balance.
+
+A card is left out when its source couldn't be read.
 
 | Section | Charts |
 |---|---|
@@ -116,16 +135,15 @@ couldn't be read.
 | Payment Intents | Created vs succeeded / canceled / incomplete · Status · Cancellation reasons · Last payment errors |
 | Refunds & Disputes | Refund / dispute / early-fraud-warning counts · Refunded vs disputed amount · Refund reasons & status · Dispute reasons & status · Fraud warning types |
 | Payouts | Payout amount by arrival date (paid / pending / failed) · Status · Method |
-| Customers | New per day · Cumulative · By country |
-| Subscriptions | New vs canceled vs ended · Active (and in-trial) count · MRR · Status · Top plans · Cancellation reasons |
-| Invoices | Created vs paid · Due / paid / remaining amounts · Status · Billing reasons · Collection methods · Top products by invoiced revenue |
-| Checkout | Completed / expired / open sessions · Conversion rate · Modes · Payment status |
+
+In daily mode only the breakdown (bar) charts are included; the daily trend
+lines appear only in multi-day reports.
 
 **Email body:** light theme, one PNG chart per metric group with activity;
 empty ones are listed in a compact "No activity in this period" note.
 
-**Interactive attachment** (`PayLess_Stripe_YYYYMMDD.html`): every chart,
-including empty ones, with hover tooltips.
+**Interactive attachment** (`IMT_Stripe_YYYYMMDD.html`, multi-day reports
+only): every chart, including empty ones, with hover tooltips.
 
 ---
 
@@ -137,12 +155,5 @@ including empty ones, with hover tooltips.
 - **Fees:** the "Fees" line is the per-transaction fee on balance
   transactions. Standalone Stripe fee debits (Billing, Radar, and so on) are
   counted in Net Volume and "Volume by transaction type".
-- **MRR** is rebuilt for each day from subscription start/end dates at each
-  subscription's *current* prices. It includes licensed (non-metered) items,
-  leaves out discounts and trial periods, and normalizes yearly, weekly and
-  daily intervals to a monthly amount. Treat it as an estimate, not Stripe
-  Billing's official MRR figure.
-- **Subscriptions** are fetched in full (not just the window) to rebuild the
-  active-count trend, so large accounts take longer on that step.
 - **Rate limits:** the Stripe SDK retries 429s/network errors
   (`max_network_retries=3`).

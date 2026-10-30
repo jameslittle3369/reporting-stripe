@@ -4,7 +4,7 @@ stripe_report.py
 ----------------
 Pulls every reportable metric from the connected Stripe account - balance
 activity, payments, payment intents, refunds, disputes, fraud warnings,
-payouts, customers, subscriptions/MRR, invoices and Checkout - builds an HTML
+and payouts - builds an HTML
 email with embedded charts and summary cards, attaches a self-contained
 interactive Chart.js HTML report, and sends it via Amazon SES.
 
@@ -13,6 +13,10 @@ Stripe's list endpoints over the lookback window. Related series share one
 chart (e.g. gross / net / fees / refunds). Any object type the API key can't
 read, or the account doesn't use, degrades to a "No activity" note instead of
 crashing the run.
+
+A 1-day window (the daily run, covering yesterday) is a trimmed report: six
+summary cards (payouts, captures, auths, refunds, fees, disputes) plus the
+breakdown bar charts - no trend lines and no interactive attachment.
 
 Setup:
   1. copy .env.example .env   and fill in STRIPE_API_KEY and the AWS SES /
@@ -23,7 +27,9 @@ Setup:
 Usage:
   python stripe_report.py                  # build and send the report
   python stripe_report.py --preview        # save locally, don't send
-  python stripe_report.py --days 7         # override the lookback window
+  python stripe_report.py --days 30        # override the lookback window (full report)
+  python stripe_report.py --date 2026-10-28                # one specific day (condensed)
+  python stripe_report.py --range 2026-10-01 2026-10-28    # inclusive date range (full report)
   python stripe_report.py --to a@b.com     # override recipients for this run
   python stripe_report.py --debug          # print a sample raw object per endpoint
 """
@@ -187,13 +193,17 @@ class Report:
         self.days = days_list                      # [date, ...] in TIMEZONE
         self.sections = {}                         # {section: [spec, ...]}
         self.notes = []                            # footnotes (e.g. other currencies)
+        self.trends = len(days_list) > 1           # a 1-day window has no trend to plot
 
     def zeros(self):
         return {d: 0 for d in self.days}
 
     def line(self, section, title, series, fmt="int"):
         """series: list of (label, {date: value}) - dates outside the window are
-        dropped, missing dates gap-filled with 0 (pct charts keep None gaps)."""
+        dropped, missing dates gap-filled with 0 (pct charts keep None gaps).
+        No-op for a single-day report."""
+        if not self.trends:
+            return
         rows = []
         for label, by_day in series:
             fill = None if fmt == "pct" else 0
@@ -243,7 +253,7 @@ REFUND_TYPES = {"refund", "payment_refund"}
 DISPUTE_TYPES = {"adjustment", "issuing_dispute"}  # dispute debits post as "adjustment"
 
 
-def collect(report, start_ts, end_ts, summary):
+def collect(report, start_ts, end_ts, summary, details):
     win = created_window(start_ts, end_ts)
     other_currency = Counter()
 
@@ -276,6 +286,11 @@ def collect(report, start_ts, end_ts, summary):
             for fd in b.get("fee_details") or []:
                 fee_types[fd.get("type")] += major(fd.get("amount"))
         report.bar(S, "Fees by Type", fee_types, "money")
+        # Charge balance transactions post at capture, so this includes captures
+        # of authorizations made on earlier days.
+        captures = [b for b in activity if b["type"] in CHARGE_TYPES]
+        summary["Captures"] = fmt_money(sum(gross.values()))
+        details["Captures"] = f"{len(captures):,} captured"
         summary["Gross Volume"] = fmt_money(sum(gross.values()))
         summary["Net Volume"] = fmt_money(sum(net.values()))
         summary["Stripe Fees"] = fmt_money(sum(fees.values()))
@@ -319,6 +334,17 @@ def collect(report, start_ts, end_ts, summary):
                    Counter(g(c, "outcome", "reason") or c.get("failure_code") for c in bad))
         report.bar(S, "Radar Risk Levels", Counter(g(c, "outcome", "risk_level") for c in charges))
 
+        # A succeeded charge is an authorization; one released without capture
+        # shows as refunded and isn't counted (matches the Dashboard).
+        auths = [c for c in ok if c.get("captured") or not c.get("refunded")]
+        captured = [c for c in auths if c.get("captured")]
+        pending = [c for c in auths if not c.get("captured")]
+        released = len(ok) - len(auths)
+        summary["Auths"] = fmt_money(sum(major(c["amount"]) for c in auths))  # full authorized amount
+        details["Auths"] = (f"{len(auths):,} auths &bull; {len(captured):,} captured ({fmt_money(sum(major(c['amount_captured']) for c in captured))})"
+                            f" &bull; {len(pending):,} pending ({fmt_money(sum(major(c['amount']) for c in pending))})"
+                            + (f" &bull; {released:,} released" if released else ""))
+
         total_attempts = len(ok) + len(bad)
         summary["Successful Payments"] = fmt_int(len(ok))
         summary["Payment Success Rate"] = fmt_pct(100 * len(ok) / total_attempts if total_attempts else None)
@@ -360,6 +386,7 @@ def collect(report, start_ts, end_ts, summary):
         count_series.append(("Disputes", daily_sum(disputes, "created")))
         amount_series.append(("Disputed", daily_sum(disputes, "created", lambda d: major(d["amount"]))))
         summary["Disputes"] = fmt_int(len(disputes))
+        details["Disputes"] = fmt_money(sum(major(d["amount"]) for d in disputes)) + " disputed"
     if efws is not None:
         count_series.append(("Early fraud warnings", daily_sum(efws, "created")))
     if count_series:
@@ -396,159 +423,11 @@ def collect(report, start_ts, end_ts, summary):
         report.bar(S, "Payout Methods", Counter(p.get("method") for p in payouts))
         summary["Paid Out"] = fmt_money(sum(major(p["amount"]) for p in payouts if p["status"] == "paid"))
 
-    # -- Customers ------------------------------------------------------------
-    S = "Customers"
-    customers = fetch_all("Customers", client.v1.customers, win)
-    if customers is None:
-        report.unavailable(S, "Customers")
-    else:
-        new = daily_sum(customers, "created")
-        running, cumulative = 0, {}
-        for d in report.days:
-            running += new.get(d, 0)
-            cumulative[d] = running
-        report.line(S, "New Customers per Day", [("New customers", new)])
-        report.line(S, "Cumulative New Customers", [("Cumulative", cumulative)])
-        report.bar(S, "New Customers by Country",
-                   Counter(g(c, "address", "country") for c in customers), top=10,
-                   labeler=lambda k: k or "Unknown")
-        summary["New Customers"] = fmt_int(len(customers))
-
-    # -- Subscriptions --------------------------------------------------------
-    # Pulls every subscription (not just ones created in the window) so the
-    # daily active-count and MRR series can be reconstructed across the period.
-    S = "Subscriptions"
-    subs = fetch_all("Subscriptions", client.v1.subscriptions, {"status": "all"})
-    products = fetch_all("Products", client.v1.products) or []
-    product_names = {p["id"]: p.get("name") or p["id"] for p in products}
-    if subs is None:
-        report.unavailable(S, "Subscriptions")
-    else:
-        subs = [s for s in subs if s["status"] not in ("incomplete", "incomplete_expired") and in_cur(s)]
-        in_window = lambda ts: ts and start_ts <= ts < end_ts
-        report.line(S, "New vs Canceled Subscriptions", [
-            ("New", daily_sum([s for s in subs if in_window(s.get("created"))], "created")),
-            ("Cancellation requested", daily_sum([s for s in subs if in_window(s.get("canceled_at"))], "canceled_at")),
-            ("Ended", daily_sum([s for s in subs if in_window(s.get("ended_at"))], "ended_at")),
-        ])
-
-        active, trialing, mrr = {}, {}, {}
-        for d in report.days:
-            eod = int(datetime(d.year, d.month, d.day, tzinfo=TIMEZONE).timestamp()) + 86400
-            a = t = 0
-            m = 0.0
-            for s in subs:
-                if (s.get("start_date") or s["created"]) >= eod:
-                    continue
-                if s.get("ended_at") and s["ended_at"] < eod:
-                    continue
-                a += 1
-                if s.get("trial_end") and s.get("trial_start") and s["trial_start"] < eod < s["trial_end"]:
-                    t += 1
-                else:
-                    m += sub_mrr(s)
-            active[d], trialing[d], mrr[d] = a, t, m
-        report.line(S, "Active Subscriptions", [("Active (incl. trials)", active), ("In trial", trialing)])
-        report.line(S, "Monthly Recurring Revenue (MRR)", [("MRR", mrr)], "money")
-
-        current = [s for s in subs if s["status"] in ("active", "trialing", "past_due")]
-        report.bar(S, "Subscription Status", Counter(s["status"] for s in subs))
-        plans = Counter()
-        for s in current:
-            for item in g(s, "items", "data", default=[]):
-                price = item.get("price") or {}
-                prod = price.get("product")
-                name = price.get("nickname") or product_names.get(prod, prod)
-                plans[name] += 1
-        report.bar(S, "Top Plans by Active Subscriptions", plans, labeler=lambda k: k or "Unknown")
-        ended = [s for s in subs if in_window(s.get("canceled_at"))]
-        report.bar(S, "Cancellation Reasons", Counter(
-            g(s, "cancellation_details", "feedback") or g(s, "cancellation_details", "reason") for s in ended))
-
-        summary["Active Subscriptions"] = fmt_int(active[report.days[-1]]) if report.days else "0"
-        summary["MRR"] = fmt_money(mrr[report.days[-1]]) if report.days else fmt_money(0)
-
-    # -- Invoices -------------------------------------------------------------
-    S = "Invoices"
-    invoices = fetch_all("Invoices", client.v1.invoices, win)
-    if invoices is None:
-        report.unavailable(S, "Invoices")
-    else:
-        invoices = [i for i in invoices if in_cur(i)]
-        paid = [i for i in invoices if g(i, "status_transitions", "paid_at")]
-        report.line(S, "Invoices Created vs Paid", [
-            ("Created", daily_sum(invoices, "created")),
-            ("Paid", daily_sum([{"t": g(i, "status_transitions", "paid_at")} for i in paid], "t")),
-        ])
-        report.line(S, "Invoice Amounts", [
-            ("Amount due", daily_sum(invoices, "created", lambda i: major(i.get("amount_due")))),
-            ("Amount paid", daily_sum(invoices, "created", lambda i: major(i.get("amount_paid")))),
-            ("Amount remaining", daily_sum(invoices, "created", lambda i: major(i.get("amount_remaining")),
-                                           lambda i: i.get("status") == "open")),
-        ], "money")
-        report.bar(S, "Invoice Status", Counter(i.get("status") for i in invoices))
-        report.bar(S, "Billing Reasons", Counter(i.get("billing_reason") for i in invoices))
-        report.bar(S, "Collection Methods", Counter(i.get("collection_method") for i in invoices))
-
-        by_product = Counter()
-        for inv in paid:
-            for line in g(inv, "lines", "data", default=[]):
-                prod = (g(line, "pricing", "price_details", "product")
-                        or g(line, "price", "product") or line.get("description"))
-                by_product[product_names.get(prod, prod)] += major(line.get("amount"))
-        report.bar(S, "Top Products by Invoiced Revenue", by_product, "money", labeler=lambda k: k or "Unknown")
-        open_due = sum(major(i.get("amount_remaining")) for i in invoices if i.get("status") == "open")
-        summary["Open Invoices"] = fmt_money(open_due)
-
-    # -- Checkout -------------------------------------------------------------
-    S = "Checkout"
-    sessions = fetch_all("Checkout sessions", client.v1.checkout.sessions, win)
-    if sessions is None:
-        report.unavailable(S, "Checkout sessions")
-    else:
-        done = daily_sum(sessions, "created", where=lambda s: s["status"] == "complete")
-        closed = daily_sum(sessions, "created", where=lambda s: s["status"] in ("complete", "expired"))
-        report.line(S, "Checkout Sessions", [
-            ("Completed", done),
-            ("Expired", daily_sum(sessions, "created", where=lambda s: s["status"] == "expired")),
-            ("Open", daily_sum(sessions, "created", where=lambda s: s["status"] == "open")),
-        ])
-        report.line(S, "Checkout Conversion Rate", [("Conversion", ratio_by_day(done, closed))], "pct")
-        report.bar(S, "Checkout Modes", Counter(s.get("mode") for s in sessions))
-        report.bar(S, "Checkout Payment Status", Counter(s.get("payment_status") for s in sessions))
-        n_closed = sum(closed.values())
-        if n_closed:
-            summary["Checkout Conversion"] = fmt_pct(100 * sum(done.values()) / n_closed)
-
     if other_currency:
         report.notes.append(
             f"Amounts are in {CURRENCY.upper()} (the account's settlement currency). Excluded "
             + ", ".join(f"{n:,} {c} object(s)" for c, n in other_currency.most_common()) + "."
         )
-
-
-INTERVAL_PER_MONTH = {"day": 365 / 12, "week": 52 / 12, "month": 1, "year": 1 / 12}
-
-
-def sub_mrr(sub) -> float:
-    """Monthly-normalized recurring amount for one subscription, at the
-    subscription's current prices (Stripe doesn't expose historical pricing
-    cheaply, so a mid-period price change is applied to the whole window).
-    Discounts and metered/tiered prices without a unit_amount are excluded."""
-    total = 0.0
-    for item in g(sub, "items", "data", default=[]):
-        price = item.get("price") or {}
-        recurring = price.get("recurring") or {}
-        if recurring.get("usage_type") == "metered":
-            continue
-        unit = price.get("unit_amount")
-        if unit is None and price.get("unit_amount_decimal"):
-            unit = float(price["unit_amount_decimal"])
-        if unit is None:
-            continue
-        per_month = INTERVAL_PER_MONTH.get(recurring.get("interval"), 0) / (recurring.get("interval_count") or 1)
-        total += major(unit) * (item.get("quantity") or 1) * per_month
-    return total
 
 
 def fetch_balance():
@@ -684,13 +563,14 @@ def inline_images_for_preview(html, images):
     return html
 
 
-def stat_box(label, value, color="#4A90D9"):
+def stat_box(label, value, color="#4A90D9", detail=None):
     return (
         '<div style="flex:1;min-width:140px;background:#fff;border-radius:8px;'
         'padding:16px 12px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08);">'
         '<div style="font-size:22px;font-weight:700;color:' + color + ';">' + str(value) + '</div>'
         '<div style="font-size:11px;color:#666;margin-top:4px;">' + label + '</div>'
-        '</div>'
+        + ('<div style="font-size:10px;color:#999;margin-top:2px;">' + detail + '</div>' if detail else '')
+        + '</div>'
     )
 
 
@@ -725,9 +605,14 @@ def build_group_email_section(section_name, specs, pngs):
     return "\n".join(parts)
 
 
-def build_email_html(report_date, days, boxes, group_sections_html, notes, attach_name):
+def build_email_html(report_date, days, boxes, group_sections_html, notes, attach_name=None):
+    """attach_name=None means no interactive attachment (the daily report)."""
     ts_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %Z")
     notes_html = "".join(f'<p style="margin:16px 0 0;font-size:11px;color:#888;">{n}</p>' for n in notes)
+    period = "Daily report" if days == 1 else f"Last {days} days"
+    footer = f"Generated {ts_str} &bull; IMT Stripe Report &bull; {period}"
+    if attach_name:
+        footer += f" &bull; See attached {attach_name} for interactive version"
 
     lines = [
         "<!DOCTYPE html>",
@@ -735,13 +620,13 @@ def build_email_html(report_date, days, boxes, group_sections_html, notes, attac
         "<head>",
         '<meta charset="UTF-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
-        "<title>PayLess Mobile Stripe Report | " + report_date + "</title>",
+        "<title>IMT Stripe Report | " + report_date + "</title>",
         "</head>",
         '<body style="margin:0;padding:0;background:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;">',
         '<div style="max-width:700px;margin:32px auto;background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.1);">',
         '<!--[if gte mso 9]><v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true" stroke="false" style="mso-width-percent:1000;"><v:fill type="gradient" color="#8B8CF6" color2="#4B45C6" angle="135"/><v:textbox style="mso-fit-shape-to-text:true" inset="0,0,0,0"><![endif]-->',
         '<div style="background-color:#8B8CF6;background:linear-gradient(135deg,#8B8CF6 0%,#4B45C6 100%);padding:28px 32px;">',
-        '<div style="color:#fff;font-size:20px;font-weight:700;">PayLess Mobile Stripe Report | ' + report_date + '</div>',
+        '<div style="color:#fff;font-size:20px;font-weight:700;">IMT Stripe Report | ' + report_date + '</div>',
         "</div>",
         '<!--[if gte mso 9]></v:textbox></v:rect><![endif]-->',
         '<div style="padding:24px 32px;">',
@@ -751,8 +636,7 @@ def build_email_html(report_date, days, boxes, group_sections_html, notes, attac
         group_sections_html,
         notes_html,
         '<p style="margin:32px 0 0;font-size:11px;color:#aaa;text-align:center;">',
-        f"Generated {ts_str} &bull; PayLess Mobile Stripe Report &bull; Last {days} days &bull; "
-        f"See attached {attach_name} for interactive version",
+        footer,
         "</p>",
         "</div>",
         "</div>",
@@ -834,7 +718,7 @@ def build_interactive_html(report_date, days, report, day_labels, cards, notes):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PayLess Mobile Stripe Report | {report_date}</title>
+<title>IMT Stripe Report | {report_date}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
 const CUR = {json.dumps(cur_symbol())};
@@ -898,7 +782,7 @@ function mk(id, type, labels, datasets, extra, fmt) {{
 <body>
 <div class="wrap">
   <header>
-    <h1>PayLess Mobile Stripe Report | {report_date}</h1>
+    <h1>IMT Stripe Report | {report_date}</h1>
     <p>Last {days} days &bull; Amounts in {CURRENCY.upper()} &bull; Hover over any chart for exact values</p>
   </header>
   <div class="body">
@@ -962,19 +846,55 @@ def send_email(subject, html_body, to_addresses, images=None, attachment_html=No
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    """Also resolves the report period into args.start_dt (midnight, TIMEZONE)
+    and an exclusive args.end_dt."""
     p = argparse.ArgumentParser(description="Stripe metrics report emailed via AWS SES")
-    p.add_argument("--days", type=int, default=None, help="Override REPORT_DAYS for this run")
+    period = p.add_mutually_exclusive_group()
+    period.add_argument("--days", type=int, default=None,
+                        help="Last N full days ending yesterday (overrides REPORT_DAYS)")
+    period.add_argument("--date", metavar="YYYY-MM-DD", default=None,
+                        help="Report a single day (condensed report)")
+    period.add_argument("--range", nargs=2, metavar=("START", "END"), default=None,
+                        help="Report an inclusive date range (full report)")
     p.add_argument("--preview", action="store_true", help="Save the report locally instead of emailing")
     p.add_argument("--to", nargs="+", default=None, help="Override recipients for this run")
     p.add_argument("--debug", action="store_true", help="Print a sample raw object from each Stripe endpoint")
-    return p.parse_args()
+    args = p.parse_args()
+
+    def midnight(s):
+        try:
+            d = datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            p.error(f"invalid date {s!r} - use YYYY-MM-DD")
+        return datetime(d.year, d.month, d.day, tzinfo=TIMEZONE)
+
+    today = datetime.now(TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+    if args.date or args.range:
+        start_s, end_s = (args.date, args.date) if args.date else args.range
+        args.start_dt, args.end_dt = midnight(start_s), midnight(end_s) + timedelta(days=1)
+        if args.end_dt <= args.start_dt:
+            p.error("--range END is before START")
+        if args.end_dt > today:
+            p.error("report dates must be before today")
+    else:
+        days = args.days or REPORT_DAYS
+        if days < 1:
+            p.error("--days must be at least 1")
+        args.end_dt = today
+        args.start_dt = today - timedelta(days=days)
+    return args
 
 
 # Summary card order - cards whose source was unreadable are simply absent.
 CARD_ORDER = [
-    "Gross Volume", "Net Volume", "Stripe Fees", "Successful Payments", "Payment Success Rate",
-    "Average Payment", "Refunded", "Disputes", "New Customers", "Active Subscriptions", "MRR",
-    "Open Invoices", "Checkout Conversion", "Paid Out", "Available Balance", "Pending Balance",
+    "Gross Volume", "Net Volume", "Stripe Fees", "Captures", "Auths", "Successful Payments", "Payment Success Rate",
+    "Average Payment", "Refunded", "Disputes", "Paid Out", "Available Balance", "Pending Balance",
+]
+
+# Single-day report cards: (display label, summary key).
+DAILY_CARDS = [
+    ("Payouts", "Paid Out"), ("Captures", "Captures"), ("Auths", "Auths"),
+    ("Refunds", "Refunded"), ("Fees", "Stripe Fees"), ("Disputes", "Disputes"),
 ]
 
 
@@ -987,16 +907,19 @@ def main():
         raise ValueError("STRIPE_API_KEY must be set in .env")
     client = stripe.StripeClient(STRIPE_API_KEY, max_network_retries=3)
 
-    days = args.days or REPORT_DAYS
     to_addresses = args.to or TO_ADDRESSES
 
-    end_dt = datetime.now(TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=days)
+    start_dt, end_dt = args.start_dt, args.end_dt
+    days = (end_dt.date() - start_dt.date()).days
     start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
-    report_date = start_dt.strftime("%b %d") + " - " + (end_dt - timedelta(days=1)).strftime("%b %d, %Y")
+    daily = days == 1
+    if daily:
+        report_date = start_dt.strftime("%b %d, %Y")
+    else:
+        report_date = start_dt.strftime("%b %d") + " - " + (end_dt - timedelta(days=1)).strftime("%b %d, %Y")
     day_list = [(start_dt + timedelta(days=i)).date() for i in range(days)]
 
-    summary = {}
+    summary, details = {}, {}
     print("Fetching Stripe balance ...")
     bal = fetch_balance()
     if bal:
@@ -1010,7 +933,7 @@ def main():
 
     print(f"Fetching Stripe objects ({days}-day window) ...")
     report = Report(day_list)
-    collect(report, start_ts, end_ts, summary)
+    collect(report, start_ts, end_ts, summary, details)
 
     print("Building charts ...")
     timestamps = [datetime(d.year, d.month, d.day, tzinfo=TIMEZONE) for d in day_list]
@@ -1027,31 +950,36 @@ def main():
     specs_by_id = {s["id"]: s for specs in report.sections.values() for s in specs}
     email_images = {chart_cid(specs_by_id[sid]): png for sid, (png, w, h) in pngs.items()}
 
-    cards = [(k, summary[k]) for k in CARD_ORDER if k in summary]
-    boxes = "".join(stat_box(label, value, PALETTE[i % len(PALETTE)]) for i, (label, value) in enumerate(cards))
+    card_keys = DAILY_CARDS if daily else [(k, k) for k in CARD_ORDER]
+    cards = [(label, summary[k], details.get(k)) for label, k in card_keys if k in summary]
+    boxes = "".join(stat_box(label, value, PALETTE[i % len(PALETTE)], detail)
+                    for i, (label, value, detail) in enumerate(cards))
 
     group_sections_html = "".join(
         build_group_email_section(name, specs, pngs) for name, specs in report.sections.items()
     )
 
-    attach_name = "PayLess_Stripe_" + end_dt.strftime("%Y%m%d") + ".html"
+    attach_name = "IMT_Stripe_" + (end_dt - timedelta(days=1)).strftime("%Y%m%d") + ".html"
 
     print("Composing email ...")
-    html_body = build_email_html(report_date, days, boxes, group_sections_html, report.notes, attach_name)
-    interactive_html = build_interactive_html(
-        report_date, days, report, [d.strftime("%b %d") for d in day_list], cards, report.notes
+    html_body = build_email_html(report_date, days, boxes, group_sections_html, report.notes,
+                                 None if daily else attach_name)
+    interactive_html = None if daily else build_interactive_html(
+        report_date, days, report, [d.strftime("%b %d") for d in day_list],
+        [(label, value) for label, value, _ in cards], report.notes
     )
 
-    subject = "PayLess Mobile Stripe Report | " + report_date
+    subject = "IMT Stripe Report | " + report_date
 
     if args.preview or not FROM_ADDRESS or not to_addresses:
         if not (FROM_ADDRESS and to_addresses) and not args.preview:
             print("FROM_ADDRESS or TO_ADDRESSES not set in .env - saving locally instead of sending.")
-        with open(attach_name, "w", encoding="utf-8") as f:
-            f.write(interactive_html)
+        if interactive_html:
+            with open(attach_name, "w", encoding="utf-8") as f:
+                f.write(interactive_html)
+            print(f"Saved interactive report to {attach_name}")
         with open(attach_name.replace(".html", "_email.html"), "w", encoding="utf-8") as f:
             f.write(inline_images_for_preview(html_body, email_images))
-        print(f"Saved interactive report to {attach_name}")
         print(f"Saved email body preview to {attach_name.replace('.html', '_email.html')}")
     else:
         print(f"Sending to {', '.join(to_addresses)} ...")

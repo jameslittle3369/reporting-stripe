@@ -2,3 +2,4 @@
 .venv/
 __pycache__/
 PayLess_Stripe_*.html
+IMT_Stripe_*.html
